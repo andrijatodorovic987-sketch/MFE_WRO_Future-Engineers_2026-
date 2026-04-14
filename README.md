@@ -174,6 +174,12 @@ Pravilna kalibracija omogućava pouzdanu obradu slike i značajno poboljšava ta
 
 Dijagram ožičenja
 <img width="975" height="475" alt="image" src="https://github.com/user-attachments/assets/453a5568-9986-4ddb-ad67-2c90dee8133d" />
+
+Slike tima
+
+<img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/956b38d4-bf0a-4b35-bc41-9e4004886ca0" />
+<img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/cbf33154-3a7e-42ef-9375-4d9c4630e263" />
+
  
 
 
