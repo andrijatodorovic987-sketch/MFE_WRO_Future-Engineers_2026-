@@ -1,0 +1,285 @@
+// ============================================
+// KONFIGURACIJA I KONSTANTE
+// ============================================
+
+POSTAVI_OSJETLJIVOST = 55
+POSTAVI_GAIN_ZA_BOJU = 16
+POSTAVI_VRIJEME_INTEGRACIJE = 1
+
+// Granice za boje (R, G, B)
+FUNKCIJA izracunaj_granice(osjetljivost)
+    inicijalne_granice = [R_min=40, R_max=100, G_min=8, G_max=60, B_min=0, B_max=30]
+    faktor = osjetljivost / 100
+   
+    AKO (faktor > 0.5) ONDA
+        prilagodi_granice_prema_faktoru()
+   
+    VRATI prilagođene_granice
+
+// Parametri vožnje
+CILJNA_UDALJENOST = 15 cm
+MAKSIMALNA_BRZINA = 40
+MINIMALNA_BRZINA = 40
+BRZINA_SKRETANJA = 30
+BRZINA_PRAVO = 40
+BRZINA_PARKIRANJA = 30
+
+// PID parametri
+KP = 5, KI = 0, KD = 1
+
+// GPIO pinovi
+SERVO_PIN = 18
+PWM_PIN = 13
+PINOVI_MOTORA = [27, 12]
+
+// Ultra zvučni senzori
+TRIG_ECHO_PAROVI = [
+    (lijevi_zid, 16, 26),
+    (desni_zid, 6, 19),
+    (prednji, 21, 20),
+    (lijevi_bocni, 23, 4),
+    (desni_bocni, 25, 24)
+]
+
+// Brojanje linija
+LINIJA_PO_KRUGU = 4
+POTREBNO_KRUGOVA = 3
+UKUPNO_LINIJA = 12
+
+GLOBALNE_VARIJABLE:
+    ukupno_linija = 0
+    zavrseni_krugovi = 0
+    detekcija_blokirana = False
+    orijentacija = "LIJEVO"  // ili "DESNO"
+    orijentacija_odredena = False
+    uspori_rezim = False
+    sve_linije_ok = False
+    vrijeme_kraja_pauze = 0
+
+// ============================================
+// KLASE I STRUKTURE
+// ============================================
+
+KLASA PID_KONTROLER:
+    ULAZI: kp, ki, kd
+    INICIJALIZACIJA:
+        prethodna_greska = 0
+        integral = 0
+   
+    METODA izracunaj(cilj, izmjereno):
+        greska = cilj - izmjereno
+        integral += greska
+        ograniči_integral()
+        derivacija = greska - prethodna_greska
+        izlaz = kp*greska + ki*integral + kd*derivacija
+        prethodna_greska = greska
+        VRATI izlaz
+
+KLASA SENZOR_BOJA:
+    INICIJALIZACIJA:
+        pokreni_I2C()
+        postavi_gain_i_vrijeme()
+        uključi_LED()
+   
+    METODA prepoznaj_boju(r, g, b):
+        AKO (r unutar [R_min, R_max] I
+            g unutar [G_min, G_max] I
+            b unutar [B_min, B_max]) ONDA
+            AKO (r > g I g > b) ONDA
+                VRATI "NARANDZASTA"
+        VRATI "Nepoznato"
+   
+    METODA citaj_boju():
+        r, g, b = očitaj_senzor()
+        VRATI prepoznaj_boju(r, g, b)
+
+// ============================================
+// FUNKCIJE ZA KRETANJE
+// ============================================
+
+FUNKCIJA postavi_servo(ugao):
+    puls = 500 + (ugao / 180) * 2000
+    postavi_servo_puls(puls)
+
+FUNKCIJA naprijed(brzina):
+    podesi_smjer_naprijed()
+    podesi_PWM(brzina * 2.55)
+
+FUNKCIJA nazad(brzina):
+    podesi_smjer_nazad()
+    podesi_PWM(brzina * 2.55)
+
+FUNKCIJA stop():
+    isključi_PWM()
+    postavi_motore_u_nulu()
+
+FUNKCIJA udaljenost(trig_pin, echo_pin):
+    generiši_trigger_puls(trig_pin)
+    izmjeri_vrijeme_echo(echo_pin)
+    udaljenost = (vrijeme * 34300) / 2
+    VRATI udaljenost
+
+// ============================================
+// LOGIKA ORIJENTACIJE
+// ============================================
+
+FUNKCIJA odredi_orijentaciju():
+    ISPIS("Određivanje orijentacije...")
+   
+    lijevo = udaljenost(TRIG_LIJEVI_BOCNI, ECHO_LIJEVI_BOCNI)
+    desno = udaljenost(TRIG_DESNI_BOCNI, ECHO_DESNI_BOCNI)
+   
+    AKO (lijevo < desno) ONDA
+        orijentacija = "LIJEVO"
+        ISPIS("Pratim LIJEVI zid")
+    INACE
+        orijentacija = "DESNO"
+        ISPIS("Pratim DESNI zid")
+   
+    orijentacija_odredena = True
+
+// ============================================
+// OBRADA DETEKCIJE LINIJA
+// ============================================
+
+FUNKCIJA obradi_detekciju_linije(boja):
+    AKO (boja == "NARANDZASTA" I detekcija_nije_blokirana) ONDA
+        ukupno_linija++
+        detekcija_blokirana = True
+        postavi_vrijeme_pauze(1.0 sekunda)
+       
+        ISPIS("Detektovana linija #{ukupno_linija}")
+       
+        AKO (ukupno_linija % LINIJA_PO_KRUGU == 0) ONDA
+            zavrseni_krugovi++
+            ISPIS("Krug {zavrseni_krugovi} završen")
+       
+        AKO (ukupno_linija == 11) ONDA
+            uspori_rezim = True
+            ISPIS("Prelazim na sporiju brzinu")
+       
+        AKO (ukupno_linija >= 12) ONDA
+            sve_linije_ok = True
+            ISPIS("Sve linije detektovane")
+
+// ============================================
+// GLAVNI PROGRAM
+// ============================================
+
+GLAVNI:
+    ISPIS("Robot za praćenje zida")
+    ISPIS("Cilj: detektovati 12 narandžastih linija")
+   
+    pokreni_senzor_boja()
+    pokreni_pigpio()
+    inicijaliziraj_motore()
+   
+    pocetna_udaljenost = udaljenost(PREDNJI_TRIG, PREDNJI_ECHO)
+   
+    SPEED = MINIMALNA_BRZINA
+    cekam_orijentaciju = True
+    zaustavljeno = False
+   
+    DOCK (NIJE zaustavljeno):
+        // OČITAVANJE SENZORA
+        lijevi_zid = udaljenost(TRIG_LIJEVI, ECHO_LIJEVI)
+        desni_zid = udaljenost(TRIG_DESNI, ECHO_DESNI)
+        prednji = udaljenost(PREDNJI_TRIG, PREDNJI_ECHO)
+       
+        // ORIJENTACIJA - kada prednji senzor vidi zid na 80cm
+        AKO (cekam_orijentaciju I prednji < 80) ONDA
+            ISPIS("Zid detektovan, određujem orijentaciju")
+            odredi_orijentaciju()
+            cekam_orijentaciju = False
+           
+            stop()
+            cekaj(0.5 sekundi)
+           
+            AKO (orijentacija == "LIJEVO") ONDA
+                skreni_lijevo(0.8 sekundi)
+            INACE
+                skreni_desno(0.8 sekundi)
+           
+            NASTAVI
+       
+        // OBRADA BLOKIRANE DETEKCIJE
+        AKO (detekcija_blokirana I vrijeme_isteklo) ONDA
+            detekcija_blokirana = False
+       
+        // DETEKCIJA BOJA
+        AKO (NIJE sve_linije_ok I NIJE detekcija_blokirana) ONDA
+            boja = citaj_boju()
+            AKO (boja == "NARANDZASTA") ONDA
+                obradi_detekciju_linije(boja)
+       
+        // PRAĆENJE ZIDA PREMA ORIJENTACIJI
+        AKO (orijentacija_odredena) ONDA
+            AKO (orijentacija == "LIJEVO") ONDA
+                greska = CILJNA_UDALJENOST - lijevi_zid
+                korekcija = PID.izracunaj(CILJNA_UDALJENOST, lijevi_zid)
+                servo_ugao = 90 + (korekcija * 0.8)
+            INACE  // DESNO
+                greska = CILJNA_UDALJENOST - desni_zid
+                korekcija = PID.izracunaj(CILJNA_UDALJENOST, desni_zid)
+                servo_ugao = 90 - (korekcija * 0.8)  // obrnuti smjer
+           
+            servo_ugao = ograniči(60, 120, servo_ugao)
+            postavi_servo(servo_ugao)
+        INACE
+            postavi_servo(90)  // vozi pravo
+       
+        // PODEŠAVANJE BRZINE
+        AKO (sve_linije_ok ILI uspori_rezim) ONDA
+            SPEED = BRZINA_PARKIRANJA
+        INACE
+            SPEED = BRZINA_PRAVO
+       
+        // IZBJEGAVANJE PREPREKA
+        AKO (5 < prednji < 35) ONDA
+            stop()
+            cekaj(0.3 sekundi)
+           
+            AKO (orijentacija == "LIJEVO") ONDA
+                postavi_servo(135)  // skreni desno
+            INACE
+                postavi_servo(45)   // skreni lijevo
+           
+            naprijed(BRZINA_SKRETANJA)
+            cekaj(0.5 sekundi)
+            postavi_servo(90)
+       
+        // POKRETANJE
+        naprijed(SPEED)
+       
+        // PROVJERA ZA ZAUSTAVLJANJE
+        AKO (sve_linije_ok) ONDA
+            front_ok = |prednji - pocetna_udaljenost| <= 10
+           
+            AKO (orijentacija == "LIJEVO") ONDA
+                left_ok = |lijevi_zid - CILJNA_UDALJENOST| <= 2
+                AKO (left_ok I front_ok) ONDA
+                    zaustavljeno = True
+            INACE
+                right_ok = |desni_zid - CILJNA_UDALJENOST| <= 2
+                AKO (right_ok I front_ok) ONDA
+                    zaustavljeno = True
+       
+        cekaj(ciklus_vrijeme)
+   
+    KRAJ_DOK
+   
+    stop()
+    ISPIS("MISIJA ZAVRŠENA")
+    ISPIS("Ukupno detektovano: {ukupno_linija} linija")
+    ISPIS("Orijentacija: {orijentacija}")
+
+// ============================================
+// ČIŠĆENJE RESURSA
+// ============================================
+
+KRAJ_PROGRAMA:
+    stop()
+    isključi_servo()
+    zatvori_pigpio()
+    očisti_senzor_boja()
+    ISPIS("Sistem isključen")
