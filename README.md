@@ -158,7 +158,7 @@ Program zatim kontinuirano obrađuje ulazne podatke i generiše komande za uprav
 
 Demonstracioni video snimci
 
-
+https://www.youtube.com/shorts/UcaWskHsVGI
 
 
 
