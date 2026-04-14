@@ -1,0 +1,455 @@
+import pigpio
+import time
+import board
+import busio
+import adafruit_tcs34725
+import RPi.GPIO as GPIO
+
+# ============================================
+# PODEŠAVANJA SENZORA ZA BOJE
+# ============================================
+GAIN = 16
+INTEGRATION_TIME = 1
+
+# ============================================
+# PARAMETAR ZA OSJETLJIVOST NARANDŽASTE
+# ============================================
+OSJETLJIVOST = 55
+
+def izracunaj_granice(osjetljivost):
+    min_r, max_r = 40, 100
+    min_g, max_g = 8, 60
+    min_b, max_b = 0, 30
+
+    faktor = osjetljivost / 100.0
+
+    if faktor > 0.5:
+        min_r = 40 + (55 - 40) * faktor * 0.5
+        max_r = 100 - (100 - 55) * faktor * 0.5
+        min_g = 8 + (12 - 8) * faktor * 0.5
+        max_g = 60 - (60 - 12) * faktor * 0.5
+        min_b = 0 + (4 - 0) * faktor * 0.5
+        max_b = 30 - (30 - 4) * faktor * 0.5
+
+    return (int(min_r), int(max_r), int(min_g), int(max_g), int(min_b), int(max_b))
+
+NARANDZASTA_GRANICE = izracunaj_granice(OSJETLJIVOST)
+
+BOJE = {
+    "NARANDZASTA": NARANDZASTA_GRANICE,
+}
+
+print(f"🎨 Osjetljivost narandžaste: {OSJETLJIVOST}/100")
+print(f"   Granice: R:{NARANDZASTA_GRANICE[0]}-{NARANDZASTA_GRANICE[1]}, "
+      f"G:{NARANDZASTA_GRANICE[2]}-{NARANDZASTA_GRANICE[3]}, "
+      f"B:{NARANDZASTA_GRANICE[4]}-{NARANDZASTA_GRANICE[5]}")
+
+# ============================================
+# PODEŠAVANJA ZA VOŽNJU
+# ============================================
+TARGET_DISTANCE_LEFT = 15   # cm (cilj za lijevi senzor kad je orijentacija LIJEVO)
+TARGET_DISTANCE_RIGHT = 15  # cm (cilj za desni senzor kad je orijentacija DESNO)
+
+MAX_SPEED = 40
+MIN_SPEED = 40
+TURN_SPEED = 30
+STRAIGHT_SPEED = 40
+PARKING_SPEED = 30
+
+# PID parametri
+KP = 5
+KI = 0.0
+KD = 1
+
+# GPIO pins za motore
+SERVO_PIN = 18
+PWM_PIN = 13
+IN4 = 27
+IN3 = 12
+
+# Ultra Sonic senzori
+TRIG_LEFT = 16      # Lijevi senzor (prati zid kad je orijentacija LIJEVO)
+ECHO_LEFT = 26
+TRIG_RIGHT = 6      # Desni senzor (prati zid kad je orijentacija DESNO)
+ECHO_RIGHT = 19
+TRIG_FRONT = 21     # Prednji senzor
+ECHO_FRONT = 20
+TRIG_LEFT_SIDE = 23  # Lijevi bočni senzor (za određivanje orijentacije)
+ECHO_LEFT_SIDE = 4
+TRIG_RIGHT_SIDE = 25 # Desni bočni senzor (za određivanje orijentacije)
+ECHO_RIGHT_SIDE = 24
+
+# ============================================
+# GLOBALE ZA BROJANJE KRUGOVA I ORIJENTACIJU
+# ============================================
+LINIJA_ZA_KRUG = 4
+POTREBNO_KRUGOVA = 3
+UKUPNO_LINIJA = LINIJA_ZA_KRUG * POTREBNO_KRUGOVA
+
+ukupno_linija = 0
+zavrseni_krugovi = 0
+detekcija_blokirana = False
+vrijeme_kraja_pauze = 0
+TIMEOUT_NAKON_DETEKCIJE = 1.0
+
+pocetna_udaljenost = 0
+orijentacija = "LIJEVO"  # Može biti "LIJEVO" ili "DESNO"
+orijentacija_odredena = False
+uspori_rezim = False
+sve_linije_ok = False
+
+# ============================================
+
+class PID:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0
+        self.integral = 0
+        self.integral_limit = 20
+
+    def compute(self, setpoint, measured):
+        error = setpoint - measured
+        self.integral += error
+        self.integral = max(-self.integral_limit, min(self.integral_limit, self.integral))
+        derivative = error - self.prev_error
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.prev_error = error
+        return output
+
+class ColorSensor:
+    def __init__(self):
+        self.sensor = None
+        self.init_sensor()
+
+    def init_sensor(self):
+        try:
+            i2c = busio.I2C(board.SCL, board.SDA)
+            self.sensor = adafruit_tcs34725.TCS34725(i2c)
+            self.sensor.gain = GAIN
+            self.sensor.integration_time = INTEGRATION_TIME
+
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(17, GPIO.OUT)
+            GPIO.output(17, True)
+            print("✅ RGB senzor inicijalizovan")
+            return True
+        except Exception as e:
+            print(f"❌ Greška: {e}")
+            return False
+
+    def prepoznaj_boju(self, r, g, b):
+        min_r, max_r, min_g, max_g, min_b, max_b = BOJE["NARANDZASTA"]
+
+        if (min_r <= r <= max_r and
+            min_g <= g <= max_g and
+            min_b <= b <= max_b):
+            if r > g and g > b:
+                return "NARANDZASTA"
+        return "Nepoznato"
+
+    def citaj_boju(self):
+        if self.sensor is None:
+            return "Nepoznato"
+        try:
+            r, g, b = self.sensor.color_rgb_bytes
+            return self.prepoznaj_boju(r, g, b)
+        except:
+            return "Nepoznato"
+
+    def cleanup(self):
+        try:
+            GPIO.output(17, False)
+            GPIO.cleanup()
+        except:
+            pass
+
+# Inicijalizacija pigpio
+pi = pigpio.pi()
+if not pi.connected:
+    print("Ne mogu se spojiti na pigpiod!")
+    exit()
+
+# Motor setup
+pi.set_mode(IN3, pigpio.OUTPUT)
+pi.set_mode(IN4, pigpio.OUTPUT)
+pi.set_mode(PWM_PIN, pigpio.OUTPUT)
+pi.set_mode(SERVO_PIN, pigpio.OUTPUT)
+
+pi.set_PWM_frequency(PWM_PIN, 100)
+pi.set_servo_pulsewidth(SERVO_PIN, 1500)
+
+# Inicijalizacija PID
+pid = PID(KP, KI, KD)
+color_sensor = ColorSensor()
+
+# Funkcije za kretanje
+def set_servo(angle):
+    pulse = 500 + (angle / 180.0) * 2000
+    pi.set_servo_pulsewidth(SERVO_PIN, pulse)
+
+def naprijed(speed):
+    pi.write(IN3, 1)
+    pi.write(IN4, 0)
+    pi.set_PWM_dutycycle(PWM_PIN, speed * 2.55)
+
+def nazad(speed):
+    pi.write(IN3, 0)
+    pi.write(IN4, 1)
+    pi.set_PWM_dutycycle(PWM_PIN, speed * 2.55)
+
+def stop():
+    pi.write(IN3, 0)
+    pi.write(IN4, 0)
+    pi.set_PWM_dutycycle(PWM_PIN, 0)
+
+def distance(trig, echo):
+    pi.write(trig, 0)
+    time.sleep(0.0002)
+    pi.write(trig, 1)
+    time.sleep(0.00001)
+    pi.write(trig, 0)
+
+    start_time = time.time()
+    timeout = start_time + 0.03
+    start = stop_time = start_time
+
+    while pi.read(echo) == 0 and time.time() < timeout:
+        start = time.time()
+    while pi.read(echo) == 1 and time.time() < timeout:
+        stop_time = time.time()
+
+    try:
+        elapsed = stop_time - start
+        dist = (elapsed * 34300) / 2
+        return dist
+    except:
+        return 999
+
+def odredi_orijentaciju():
+    """Određuje orijentaciju na osnovu bočnih senzora"""
+    global orijentacija, orijentacija_odredena
+
+    print("\n🧭 Određivanje orijentacije...")
+
+    left_side = distance(TRIG_LEFT_SIDE, ECHO_LEFT_SIDE)
+    right_side = distance(TRIG_RIGHT_SIDE, ECHO_RIGHT_SIDE)
+
+    print(f"   Lijevi bočni: {left_side:.1f}cm")
+    print(f"   Desni bočni: {right_side:.1f}cm")
+
+    if left_side < right_side:
+        orijentacija = "LIJEVO"
+        print(f"   ✅ Određena orijentacija: LIJEVO (pratit ću LIJEVI zid na {TARGET_DISTANCE_LEFT}cm)")
+    else:
+        orijentacija = "DESNO"
+        print(f"   ✅ Određena orijentacija: DESNO (pratit ću DESNI zid na {TARGET_DISTANCE_RIGHT}cm)")
+
+    orijentacija_odredena = True
+
+def obradi_detekciju_linije(boja):
+    global ukupno_linija, zavrseni_krugovi, uspori_rezim, sve_linije_ok, detekcija_blokirana, vrijeme_kraja_pauze
+
+    if boja == "NARANDZASTA" and not detekcija_blokirana:
+        ukupno_linija += 1
+
+        detekcija_blokirana = True
+        vrijeme_kraja_pauze = time.time() + TIMEOUT_NAKON_DETEKCIJE
+
+        print(f"\n📏 NARANDZASTA linija #{ukupno_linija}/{UKUPNO_LINIJA}")
+        print(f"⏰ Pauza {TIMEOUT_NAKON_DETEKCIJE}s")
+
+        if ukupno_linija % LINIJA_ZA_KRUG == 0:
+            zavrseni_krugovi += 1
+            print(f"🎉 KRUG {zavrseni_krugovi} završen!")
+
+        if ukupno_linija == 11 and not uspori_rezim:
+            print(f"\n🐌 Detektovana 11. linija - prelazim na SPORIJU brzinu!")
+            uspori_rezim = True
+
+        if ukupno_linija >= 12 and not sve_linije_ok:
+            print(f"\n🏁 Detektovana 12. linija - sve linije detektovane!")
+            sve_linije_ok = True
+
+    return False
+
+# ============================================
+# GLAVNI PROGRAM
+# ============================================
+
+print("=" * 60)
+print("🤖 ROBOT ZA PRAĆENJE ZIDA - SA ORIJENTACIJOM")
+print("=" * 60)
+print(f"Cilj: {UKUPNO_LINIJA} narandžastih linija (3 kruga)")
+print(f"Osjetljivost: {OSJETLJIVOST}/100")
+print("=" * 60)
+
+# Mjerenje početne udaljenosti
+print("\n📏 Mjerenje početne udaljenosti...")
+pocetna_udaljenost = distance(TRIG_FRONT, ECHO_FRONT)
+print(f"Početna prednja udaljenost: {pocetna_udaljenost:.1f}cm")
+
+print("\n🚀 Pokretanje misije za 2 sekunde...")
+time.sleep(2)
+
+try:
+    speed = MIN_SPEED
+    zadnje_vrijeme_statusa = time.time()
+    zaustavljeno = False
+    cycle_time = 0.01
+    cekam_orijentaciju = True
+
+    while not zaustavljeno:
+        left_dist = distance(TRIG_LEFT, ECHO_LEFT)
+        right_dist = distance(TRIG_RIGHT, ECHO_RIGHT)
+        front_dist = distance(TRIG_FRONT, ECHO_FRONT)
+        left_side = distance(TRIG_LEFT_SIDE, ECHO_LEFT_SIDE)
+        right_side = distance(TRIG_RIGHT_SIDE, ECHO_RIGHT_SIDE)
+
+        trenutno_vrijeme = time.time()
+
+        # ============================================
+        # ORIJENTACIJA - kada prednji senzor detektuje zid na 80cm
+        # ============================================
+        if cekam_orijentaciju and front_dist < 80:
+            print(f"\n🚪 Prednji senzor detektovao zid na {front_dist:.1f}cm!")
+            odredi_orijentaciju()
+            cekam_orijentaciju = False
+
+            # Kratko zaustavljanje prije skretanja
+            stop()
+            time.sleep(0.5)
+
+            # Skreni u odnosu na orijentaciju
+            if orijentacija == "LIJEVO":
+                print("🔄 Skrećem LIJEVO i tražim lijevi zid...")
+                set_servo(45)  # Skreni lijevo
+                time.sleep(0.8)
+                set_servo(90)
+            else:
+                print("🔄 Skrećem DESNO i tražim desni zid...")
+                set_servo(135)  # Skreni desno
+                time.sleep(0.8)
+                set_servo(90)
+
+            print("✅ Nastavljam vožnju\n")
+            continue
+
+        # Provjera pauze za detekciju boja
+        if detekcija_blokirana and trenutno_vrijeme >= vrijeme_kraja_pauze:
+            detekcija_blokirana = False
+            print(f"\n✅ Detekcija ponovo aktivna")
+
+        # Detekcija boja
+        if not sve_linije_ok and not detekcija_blokirana:
+            trenutna_boja = color_sensor.citaj_boju()
+            if trenutna_boja == "NARANDZASTA":
+                print(f"\n🎨 DETEKTOVANO!")
+                obradi_detekciju_linije(trenutna_boja)
+
+        # ============================================
+        # PRAĆENJE ZIDA NA OSNOVU ORIJENTACIJE
+        # ============================================
+        if orijentacija_odredena:
+            if orijentacija == "LIJEVO":
+                # Prati LIJEVI zid na 15cm
+                target = TARGET_DISTANCE_LEFT
+                error = target - left_dist
+
+                # PID korekcija za lijevi zid
+                correction = pid.compute(target, left_dist)
+                servo_angle = 90 + correction * 0.8
+
+                # Ispis za lijevu orijentaciju
+                if time.time() - zadnje_vrijeme_statusa > 0.3:
+                    print(f"\r📊 ORIJENTACIJA: LIJEVO | L zid:{left_dist:4.1f}cm | Greška:{error:+4.1f} | Ugao:{servo_angle-90:+3.0f}°", end="")
+
+            else:
+                # Prati DESNI zid na 15cm
+                target = TARGET_DISTANCE_RIGHT
+                error = target - right_dist
+
+                # PID korekcija za desni zid (obrnuti smjer)
+                correction = pid.compute(target, right_dist)
+                servo_angle = 90 - correction * 0.8  # Obrnuto za desni zid
+
+                # Ispis za desnu orijentaciju
+                if time.time() - zadnje_vrijeme_statusa > 0.3:
+                    print(f"\r📊 ORIJENTACIJA: DESNO | D zid:{right_dist:4.1f}cm | Greška:{error:+4.1f} | Ugao:{servo_angle-90:+3.0f}°", end="")
+
+            # Ograničenje servo ugla
+            servo_angle = max(60, min(120, servo_angle))
+            set_servo(servo_angle)
+        else:
+            # Još nema orijentacije - vozi pravo
+            set_servo(90)
+            if time.time() - zadnje_vrijeme_statusa > 0.3:
+                print(f"\r📊 Čekam orijentaciju | Front:{front_dist:4.1f}cm | LB:{left_side:4.1f}cm | DB:{right_side:4.1f}cm    ", end="")
+
+        # PODEŠAVANJE BRZINE
+        if sve_linije_ok:
+            speed = PARKING_SPEED
+        elif uspori_rezim:
+            speed = PARKING_SPEED
+        else:
+            speed = STRAIGHT_SPEED
+
+        # Izbjegavanje prepreka
+        if front_dist < 35 and front_dist > 5:
+            print(f"\n⚠️ PRIPREKA NA {front_dist:.1f}cm!")
+            stop()
+            time.sleep(0.3)
+
+            if orijentacija == "LIJEVO":
+                set_servo(135)  # Skreni desno
+            else:
+                set_servo(45)   # Skreni lijevo
+
+            naprijed(TURN_SPEED)
+            time.sleep(0.5)
+            set_servo(90)
+            print("✅ Zaobišao prepreku")
+
+        # Vozi
+        naprijed(speed)
+
+        # Provjera za zaustavljanje nakon 12. linije
+        if sve_linije_ok:
+            front_ok = abs(front_dist - pocetna_udaljenost) <= 10
+            if orijentacija == "LIJEVO":
+                left_ok = abs(left_dist - TARGET_DISTANCE_LEFT) <= 2
+                if left_ok and front_ok:
+                    print(f"\n\n✅ ZAUSTAVLJAM SE!")
+                    zaustavljeno = True
+                    break
+            else:
+                right_ok = abs(right_dist - TARGET_DISTANCE_RIGHT) <= 2
+                if right_ok and front_ok:
+                    print(f"\n\n✅ ZAUSTAVLJAM SE!")
+                    zaustavljeno = True
+                    break
+
+        zadnje_vrijeme_statusa = time.time()
+        time.sleep(cycle_time)
+
+    stop()
+    print("\n" + "=" * 60)
+    print("🎉 MISIJA USPJEŠNO ZAVRŠENA! 🎉")
+    print(f"📊 Ukupno detektovanih linija: {ukupno_linija}")
+    print(f"🎯 Završenih krugova: {zavrseni_krugovi}")
+    print(f"🧭 Orijentacija: {orijentacija}")
+    print("=" * 60)
+
+except KeyboardInterrupt:
+    print("\n\n⚠️ Prekinuto od strane korisnika")
+
+except Exception as e:
+    print(f"\n❌ Greška: {e}")
+
+finally:
+    stop()
+    pi.set_servo_pulsewidth(SERVO_PIN, 0)
+    pi.stop()
+    color_sensor.cleanup()
+    print("\n🔌 Sistem isključen")
