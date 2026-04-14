@@ -174,7 +174,8 @@ Pored kamera, vrši se i kalibracija visine zidova. Sistem se pokreće u manueln
 Pravilna kalibracija omogućava pouzdanu obradu slike i značajno poboljšava tačnost autonomne vožnje.
 
 Dijagram ožičenja
-<img width="975" height="475" alt="image" src="https://github.com/user-attachments/assets/453a5568-9986-4ddb-ad67-2c90dee8133d" />
+<img width="1348" height="643" alt="image" src="https://github.com/user-attachments/assets/b8a9f148-f8e9-4bbc-b731-c50cbfe302c9" />
+
 
 Slike tima
 
@@ -183,5 +184,4 @@ Slike tima
 
 
  
-
 
