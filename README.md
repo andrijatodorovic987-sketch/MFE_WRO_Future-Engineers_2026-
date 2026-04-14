@@ -178,7 +178,7 @@ Dijagram ožičenja
 Slike tima
 
 <img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/956b38d4-bf0a-4b35-bc41-9e4004886ca0" />
-<img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/cbf33154-3a7e-42ef-9375-4d9c4630e263" />
+
 
  
 
