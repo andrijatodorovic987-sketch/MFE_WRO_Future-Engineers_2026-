@@ -91,12 +91,13 @@ Senzori
 SLIKE ROBOTA
 
 
-<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/0d39d4a0-6914-4eec-80b1-7aa16f751630" />
- <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/c7a6d514-61ee-4673-8103-7c185b2e584e" />
- <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/4d25177e-2429-49dd-8410-08f1026698c4" />
-   <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/fa1e6108-ba65-4c0f-ab29-5afb58f4ad6e" />
-<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/a8022ac7-1826-46d2-a533-787b9ecaca67" />
-<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/5433b0c5-a41e-4c14-82bb-154791f1f0ac" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/e6c334da-9d9c-40e5-9158-36c56c97dbe3" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/488a0a22-6619-4ac1-8a3b-f37ac66a80a6" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/b735fb5c-6b0e-45d5-bc84-21443998390e" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/5d25f5ee-cc4e-497f-9857-bf9ad2ee3c64" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/b50cc8a0-67ad-4930-80c4-17db11757e66" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/8d492adc-0e01-4207-b2bb-bf2cc6c898d3" />
+
                
                                               
 
