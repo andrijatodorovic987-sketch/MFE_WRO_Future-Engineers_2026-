@@ -1,0 +1,1321 @@
+from flask import Flask, Response, request, jsonify
+import cv2
+import numpy as np
+import pigpio
+import time
+import serial
+import threading
+
+app = Flask(__name__)
+
+# ======================
+# GYRO KONFIGURACIJA
+# ======================
+GYRO_PORT = '/dev/serial0'
+GYRO_BAUD = 115200
+gyro_raw_angle = 0
+gyro_velocity = 0
+gyro_direction = "STOP"
+gyro_connected = False
+gyro_start_angle = 0
+gyro_last_update = 0
+gyro_parking_zero = 0  # Pamti 0 kada krene isparkiravanje
+
+# ======================
+# PARAMETRI ZA PARKIRANJE (TI UNOSIŠ)
+# ======================
+PARKING_PARAMS = {
+    "INITIAL_BACKWARD_TIME": 0.4,   # Prvo kretanje nazad
+    "FORWARD_TIME": 0.7,            # Kretanje naprijed
+    "BACKWARD_TIME": 0.6,           # Kretanje nazad nakon ispravljanja
+    "FINAL_FORWARD_TIME": 1.5,      # Zadnje kretanje naprijed
+    "SPEED": 50,                    # Brzina parkiranja
+    "SERVO_LEFT": 55,               # Servo ugao za lijevo
+    "SERVO_RIGHT": 125,             # Servo ugao za desno
+    "SERVO_CENTER": 90,             # Centar servo
+    "PARKING_DIRECTION": "LEFT",    # "LEFT" ili "RIGHT" - ti biraš
+}
+
+# ======================
+# PARAMETRI ZA GLAVNI PROGRAM
+# ======================
+params = {
+    "CENTER": 90,
+    "LEFT": 55,
+    "RIGHT": 115,
+    "SERVO_OFFSET": -10,
+    "PWM_PIN": 13,
+    "SERVO_PIN": 18,
+    "IN3": 27,
+    "IN4": 12,
+    "TRIG": 21,
+    "ECHO": 20,
+    # NOVI SENZORI
+    "TRIG_LEFT": 16,    # levi senzor trig
+    "ECHO_LEFT": 26,    # levi senzor echo
+    "TRIG_RIGHT": 6,    # desni senzor trig
+    "ECHO_RIGHT": 19,   # desni senzor echo
+    "DIST_THRESHOLD": 30,
+    "speed": 45,
+    "TURN_SPEED": 45,
+    "STRAIGHT_TIME": 0.8,
+    "STOP_TIME": 0,
+    "TURN_ANGLE": 20,
+    "PID_KP": 0.25,
+    "PID_KI": 0.005,
+    "PID_KD": 0.03,
+    "DEAD_ZONE": 15,
+    "FINAL_TURN_DIRECTION": "LEFT",
+    "FINAL_TURN_ANGLE": 55,
+    "FINAL_TURN_SERVO_LEFT": 25,
+    "FINAL_TURN_SERVO_RIGHT": 135,
+    "FINAL_TURN_SPEED": 38,
+    "SEARCH_SPEED": 40,  # Brzina traženja prepreke
+    "ROI_BOTTOM_CUT": 80,  # Koliko piksela odrezati ODOZDO (0 = cijeli ekran, veci broj = vise odrezano odozdo)
+    # NOVI PARAMETRI
+    "OBSTACLE_AVOID_TIMEOUT": 3.0,  # 3 sekunde čekanja prije izbjegavanja
+    "AVOID_TURN_TIME": 0.8,         # vrijeme skretanja
+    "LEFT_TURN_SPEED": 40,          # Brzina kretanja lijevo nakon prve prepreke
+    "FRONT_DIST_THRESHOLD": 70,     # Ako je prednji senzor manji od 70cm, ide lijevo
+}
+
+running = False
+parking_active = False
+parking_step = 0
+parking_step_start_time = 0
+parking_direction = "LEFT"  # LEFT ili RIGHT
+
+last_distance = 30
+mode = "WAIT_FOR_OBJECT"
+action_start_time = 0
+current_turn_direction = None
+initial_turn_direction = None
+detected_color = None
+pid_integral = 0
+last_error = 0
+last_servo_angle = params["CENTER"]
+obstacle_counter = 0
+search_after_parking = False
+search_direction = "LEFT"
+last_obstacle_color = None  # Pamti boju zadnje zaobiđene prepreke
+wait_start_time = 0  # Vrijeme kada je ušao u WAIT_FOR_OBJECT mode
+
+# ======================
+# PIGPIO
+# ======================
+pi = pigpio.pi()
+if not pi.connected:
+    raise RuntimeError("pigpio nije pokrenut - pokreni 'sudo pigpiod'")
+
+for pin in [params["IN3"], params["IN4"], params["PWM_PIN"], params["SERVO_PIN"], params["TRIG"], params["TRIG_LEFT"], params["TRIG_RIGHT"]]:
+    pi.set_mode(pin, pigpio.OUTPUT)
+
+pi.set_mode(params["ECHO"], pigpio.INPUT)
+pi.set_mode(params["ECHO_LEFT"], pigpio.INPUT)
+pi.set_mode(params["ECHO_RIGHT"], pigpio.INPUT)
+pi.set_PWM_frequency(params["PWM_PIN"], 1000)
+
+# ======================
+# MOTOR KONTROLA
+# ======================
+def motor_forward(speed=None):
+    if speed is None:
+        speed = params["speed"]
+    pi.write(params["IN3"], 0)
+    pi.write(params["IN4"], 1)
+    pi.set_PWM_dutycycle(params["PWM_PIN"], int(speed * 2.55))
+
+def motor_backward(speed=None):
+    if speed is None:
+        speed = params["speed"]
+    pi.write(params["IN3"], 1)
+    pi.write(params["IN4"], 0)
+    pi.set_PWM_dutycycle(params["PWM_PIN"], int(speed * 2.55))
+
+def motor_stop():
+    pi.write(params["IN3"], 0)
+    pi.write(params["IN4"], 0)
+    pi.set_PWM_dutycycle(params["PWM_PIN"], 0)
+
+# ======================
+# SERVO KONTROLA
+# ======================
+def set_servo(angle):
+    global last_servo_angle
+    angle += params["SERVO_OFFSET"]
+    angle = max(60, min(120, angle))
+    pulse = 500 + (angle / 180.0) * 2000
+    pi.set_servo_pulsewidth(params["SERVO_PIN"], pulse)
+    last_servo_angle = angle
+
+def set_servo_turn(direction):
+    angle = params[direction]
+    angle += params["SERVO_OFFSET"]
+    angle = max(60, min(120, angle))
+    pulse = 500 + (angle / 180.0) * 2000
+    pi.set_servo_pulsewidth(params["SERVO_PIN"], pulse)
+
+# ======================
+# ULTRASONIC
+# ======================
+def get_distance():
+    global last_distance
+    try:
+        pi.write(params["TRIG"], 0)
+        time.sleep(0.05)
+
+        pi.write(params["TRIG"], 1)
+        time.sleep(0.00001)
+        pi.write(params["TRIG"], 0)
+
+        start = time.time()
+        stop = start
+        timeout = time.time() + 0.1
+
+        while pi.read(params["ECHO"]) == 0:
+            start = time.time()
+            if time.time() > timeout:
+                return last_distance
+
+        while pi.read(params["ECHO"]) == 1:
+            stop = time.time()
+            if time.time() > timeout:
+                return last_distance
+
+        distance = (stop - start) * 34300 / 2
+
+        if 0 < distance < 500:
+            last_distance = distance
+            return distance
+        else:
+            return last_distance
+
+    except Exception:
+        return last_distance
+
+def get_distance_left():
+    """Mjeri udaljenost lijevim senzorom"""
+    try:
+        pi.write(params["TRIG_LEFT"], 0)
+        time.sleep(0.05)
+
+        pi.write(params["TRIG_LEFT"], 1)
+        time.sleep(0.00001)
+        pi.write(params["TRIG_LEFT"], 0)
+
+        start = time.time()
+        stop = start
+        timeout = time.time() + 0.1
+
+        while pi.read(params["ECHO_LEFT"]) == 0:
+            start = time.time()
+            if time.time() > timeout:
+                return 100
+
+        while pi.read(params["ECHO_LEFT"]) == 1:
+            stop = time.time()
+            if time.time() > timeout:
+                return 100
+
+        distance = (stop - start) * 34300 / 2
+
+        if 0 < distance < 500:
+            return distance
+        else:
+            return 100
+
+    except Exception:
+        return 100
+
+def get_distance_right():
+    """Mjeri udaljenost desnim senzorom"""
+    try:
+        pi.write(params["TRIG_RIGHT"], 0)
+        time.sleep(0.05)
+
+        pi.write(params["TRIG_RIGHT"], 1)
+        time.sleep(0.00001)
+        pi.write(params["TRIG_RIGHT"], 0)
+
+        start = time.time()
+        stop = start
+        timeout = time.time() + 0.1
+
+        while pi.read(params["ECHO_RIGHT"]) == 0:
+            start = time.time()
+            if time.time() > timeout:
+                return 100
+
+        while pi.read(params["ECHO_RIGHT"]) == 1:
+            stop = time.time()
+            if time.time() > timeout:
+                return 100
+
+        distance = (stop - start) * 34300 / 2
+
+        if 0 < distance < 500:
+            return distance
+        else:
+            return 100
+
+    except Exception:
+        return 100
+
+# ======================
+# GIROSKOP FUNKCIJE
+# ======================
+def gyro_reader_thread():
+    global gyro_raw_angle, gyro_velocity, gyro_direction, gyro_connected, gyro_last_update
+
+    try:
+        ser = serial.Serial(
+            port=GYRO_PORT,
+            baudrate=GYRO_BAUD,
+            timeout=1
+        )
+        print("✅ Žiroskop povezan!")
+        gyro_connected = True
+        time.sleep(2)
+
+        while True:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8').strip()
+
+                if line and line != "READY":
+                    parts = line.split('|')
+                    if len(parts) == 3:
+                        try:
+                            gyro_raw_angle = float(parts[0])
+                            gyro_velocity = float(parts[1])
+                            gyro_direction = parts[2]
+                            gyro_last_update = time.time()
+                        except ValueError:
+                            pass
+            time.sleep(0.01)
+
+    except serial.SerialException as e:
+        print(f"❌ Gyro greška: {e}")
+        gyro_connected = False
+    except Exception as e:
+        print(f"❌ Neočekivana greška: {e}")
+        gyro_connected = False
+
+def reset_gyro_zero():
+    global gyro_start_angle
+    gyro_start_angle = gyro_raw_angle
+    print(f"   🎯 Žiroskop resetovan - start: {gyro_start_angle:.1f}°")
+
+def get_gyro_change():
+    change = gyro_raw_angle - gyro_start_angle
+    return change
+
+def get_gyro_change_from_parking_zero():
+    """Vrati promjenu od trenutka kada je krenulo isparkiravanje"""
+    change = gyro_raw_angle - gyro_parking_zero
+    return change
+
+def set_parking_zero():
+    global gyro_parking_zero
+    gyro_parking_zero = gyro_raw_angle
+    print(f"   🎯 Parking zero postavljen na: {gyro_parking_zero:.1f}°")
+
+# ======================
+# PARKING FUNKCIJA - ISPARKIRAVANJE
+# ======================
+def start_parking():
+    global parking_active, parking_step, parking_step_start_time, running, mode
+    global parking_direction, search_after_parking, search_direction
+
+    running = False
+    motor_stop()
+
+    parking_direction = PARKING_PARAMS["PARKING_DIRECTION"]
+    parking_active = True
+    parking_step = 1
+    parking_step_start_time = time.time()
+    search_after_parking = False
+
+    # ZAPAMTI 0 prije pocetka isparkiravanja
+    set_parking_zero()
+
+    print("\n" + "="*50)
+    print(f"🚗 ISPARKIRAVANJE - ZAPOČETO (smjer: {parking_direction})")
+    print("="*50)
+    print(f"📋 Korak 1: Vožnja NAZAD {PARKING_PARAMS['INITIAL_BACKWARD_TIME']}s")
+
+def parking_loop():
+    global parking_active, parking_step, parking_step_start_time, running, mode
+    global search_after_parking, search_direction
+
+    if not parking_active:
+        return False
+
+    current_time = time.time()
+    elapsed = current_time - parking_step_start_time
+
+    # ===== KORAK 1: Vožnja nazad =====
+    if parking_step == 1:
+        motor_backward(PARKING_PARAMS["SPEED"])
+        set_servo(PARKING_PARAMS["SERVO_CENTER"])
+
+        if elapsed >= PARKING_PARAMS["INITIAL_BACKWARD_TIME"]:
+            motor_stop()
+            parking_step = 2
+            parking_step_start_time = time.time()
+            print(f"✅ Korak 1 završen")
+            print(f"📋 Korak 2: Pauza")
+
+    # ===== KORAK 2: Pauza =====
+    elif parking_step == 2:
+        if elapsed >= 0.2:
+            parking_step = 3
+            parking_step_start_time = time.time()
+            if parking_direction == "LEFT":
+                print(f"📋 Korak 3: Skrećem točkove LIJEVO (servo {PARKING_PARAMS['SERVO_LEFT']}°)")
+            else:
+                print(f"📋 Korak 3: Skrećem točkove DESNO (servo {PARKING_PARAMS['SERVO_RIGHT']}°)")
+
+    # ===== KORAK 3: Skreni točkove =====
+    elif parking_step == 3:
+        if parking_direction == "LEFT":
+            set_servo(PARKING_PARAMS["SERVO_LEFT"])
+        else:
+            set_servo(PARKING_PARAMS["SERVO_RIGHT"])
+        time.sleep(0.3)
+        parking_step = 4
+        parking_step_start_time = time.time()
+        print(f"✅ Korak 3 završen")
+        print(f"📋 Korak 4: Vožnja NAPRIJED {PARKING_PARAMS['FORWARD_TIME']}s")
+
+    # ===== KORAK 4: Vožnja naprijed =====
+    elif parking_step == 4:
+        motor_forward(PARKING_PARAMS["SPEED"])
+
+        if elapsed >= PARKING_PARAMS["FORWARD_TIME"]:
+            motor_stop()
+            parking_step = 5
+            parking_step_start_time = time.time()
+            print(f"✅ Korak 4 završen")
+            print(f"📋 Korak 5: Pauza")
+
+    # ===== KORAK 5: Pauza =====
+    elif parking_step == 5:
+        if elapsed >= 0.2:
+            parking_step = 6
+            parking_step_start_time = time.time()
+            print(f"📋 Korak 6: Ispravljam točkove")
+
+    # ===== KORAK 6: Ispravi točkove =====
+    elif parking_step == 6:
+        set_servo(PARKING_PARAMS["SERVO_CENTER"])
+        time.sleep(0.3)
+        parking_step = 7
+        parking_step_start_time = time.time()
+        print(f"✅ Korak 6 završen")
+        print(f"📋 Korak 7: Vožnja NAZAD {PARKING_PARAMS['BACKWARD_TIME']}s")
+
+    # ===== KORAK 7: Vožnja nazad =====
+    elif parking_step == 7:
+        motor_backward(PARKING_PARAMS["SPEED"])
+
+        if elapsed >= PARKING_PARAMS["BACKWARD_TIME"]:
+            motor_stop()
+            parking_step = 8
+            parking_step_start_time = time.time()
+            print(f"✅ Korak 7 završen")
+            print(f"📋 Korak 8: Pauza")
+
+    # ===== KORAK 8: Pauza =====
+    elif parking_step == 8:
+        if elapsed >= 0.2:
+            parking_step = 9
+            parking_step_start_time = time.time()
+            if parking_direction == "LEFT":
+                print(f"📋 Korak 9: Skrećem točkove LIJEVO (servo {PARKING_PARAMS['SERVO_LEFT']}°)")
+            else:
+                print(f"📋 Korak 9: Skrećem točkove DESNO (servo {PARKING_PARAMS['SERVO_RIGHT']}°)")
+
+    # ===== KORAK 9: Skreni točkove =====
+    elif parking_step == 9:
+        if parking_direction == "LEFT":
+            set_servo(PARKING_PARAMS["SERVO_LEFT"])
+        else:
+            set_servo(PARKING_PARAMS["SERVO_RIGHT"])
+        time.sleep(0.3)
+        parking_step = 10
+        parking_step_start_time = time.time()
+        print(f"✅ Korak 9 završen")
+        print(f"📋 Korak 10: Vožnja NAPRIJED {PARKING_PARAMS['FINAL_FORWARD_TIME']}s")
+
+    # ===== KORAK 10: Vožnja naprijed =====
+    elif parking_step == 10:
+        motor_forward(PARKING_PARAMS["SPEED"])
+
+        if elapsed >= PARKING_PARAMS["FINAL_FORWARD_TIME"]:
+            motor_stop()
+            parking_step = 11
+            parking_step_start_time = time.time()
+            print(f"✅ Korak 10 završen")
+            print(f"📋 Korak 11: Pauza")
+
+    # ===== KORAK 11: Pauza =====
+    elif parking_step == 11:
+        if elapsed >= 0.2:
+            parking_step = 12
+            parking_step_start_time = time.time()
+            if parking_direction == "LEFT":
+                print(f"📋 Korak 12: Skrećem točkove DESNO i vraćam se na 0°")
+            else:
+                print(f"📋 Korak 12: Skrećem točkove LIJEVO i vraćam se na 0°")
+
+    # ===== KORAK 12: Skreni u suprotnom smjeru i vraćaj se na 0° =====
+    elif parking_step == 12:
+        if parking_direction == "LEFT":
+            set_servo(PARKING_PARAMS["SERVO_RIGHT"])
+            motor_forward(PARKING_PARAMS["SPEED"])
+            current_change = get_gyro_change_from_parking_zero()
+            print(f"   Vraćanje na 0°: {current_change:.1f}°", end="\r")
+
+            if abs(current_change) < 3:
+                motor_stop()
+                parking_step = 13
+                parking_step_start_time = time.time()
+                print(f"\n✅ Korak 12 završen - vratio se na 0°")
+        else:  # RIGHT
+            set_servo(PARKING_PARAMS["SERVO_LEFT"])
+            motor_forward(PARKING_PARAMS["SPEED"])
+            current_change = get_gyro_change_from_parking_zero()
+            print(f"   Vraćanje na 0°: {current_change:.1f}°", end="\r")
+
+            if abs(current_change) < 3:
+                motor_stop()
+                parking_step = 13
+                parking_step_start_time = time.time()
+                print(f"\n✅ Korak 12 završen - vratio se na 0°")
+
+    # ===== KORAK 13: Završetak isparkiravanja, prelazak u search mode =====
+    elif parking_step == 13:
+        if elapsed >= 0.5:
+            set_servo(PARKING_PARAMS["SERVO_CENTER"])
+            time.sleep(0.2)
+            parking_active = False
+            search_after_parking = True
+            search_direction = parking_direction
+            print("\n" + "="*50)
+            print("✅ ISPARKIRAVANJE - ZAVRŠENO!")
+            print(f"🔍 Prelazim u SEARCH MODE - tražim prepreku {'LIJEVO' if search_direction == 'LEFT' else 'DESNO'}")
+            print("="*50)
+            return False
+
+    return True
+
+# ======================
+# SEARCH MODE - traženje prepreke nakon parkinga
+# ======================
+def search_for_obstacle():
+    global mode, search_after_parking, search_direction, running, last_obstacle_color
+
+    if not search_after_parking:
+        return
+
+    # Ako imamo zadnju boju, postavi smjer traženja na osnovu nje
+    if last_obstacle_color:
+        if last_obstacle_color == "GREEN":
+            search_direction = "RIGHT"
+            print(f"🔍 SEARCH MODE: Nakon zaobilaženja ZELENE, tražim prepreku DESNO")
+        elif last_obstacle_color == "RED":
+            search_direction = "LEFT"
+            print(f"🔍 SEARCH MODE: Nakon zaobilaženja CRVENE, tražim prepreku LIJEVO")
+    else:
+        # Ako nema zadnje boje, koristi default iz parkinga
+        print(f"🔍 SEARCH MODE: Tražim prepreku {'LIJEVO' if search_direction == 'LEFT' else 'DESNO'} (default)")
+
+    # Skreni u smjeru traženja
+    if search_direction == "LEFT":
+        set_servo_turn("LEFT")
+    else:
+        set_servo_turn("RIGHT")
+
+    time.sleep(0.2)
+
+    # Lagano se okreći dok ne vidi prepreku
+    motor_forward(params["SEARCH_SPEED"])
+
+    # Resetuj gyro za pracenje rotacije
+    reset_gyro_zero()
+    search_start_time = time.time()
+
+    # Ulazi u poseban mode za traženje
+    mode = "SEARCHING"
+
+# Pokreni gyro thread
+gyro_thread = threading.Thread(target=gyro_reader_thread, daemon=True)
+gyro_thread.start()
+time.sleep(2)
+
+# ======================
+# KAMERA
+# ======================
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+frame_counter = 0
+DETECTION_EVERY_N_FRAMES = 2
+last_detection_result = None
+last_detection_frame_time = 0
+
+def apply_roi(frame):
+    """Primjeni ROI - odsiječe donji dio slike"""
+    h, w = frame.shape[:2]
+    cut_from_bottom = params["ROI_BOTTOM_CUT"]
+
+    if cut_from_bottom > 0 and cut_from_bottom < h:
+        # Odsiječemo donji dio
+        roi_frame = frame[0:h-cut_from_bottom, :]
+        return roi_frame
+    return frame
+
+def find_best_object_fast(frame_small):
+    hsv = cv2.cvtColor(frame_small, cv2.COLOR_BGR2HSV)
+
+    lower_green = np.array([40, 40, 40])
+    upper_green = np.array([80, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+
+    lower_red1 = np.array([0, 100, 100])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([160, 100, 100])
+    upper_red2 = np.array([180, 255, 255])
+    red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+    green_pixels = cv2.countNonZero(green_mask)
+    red_pixels = cv2.countNonZero(red_mask)
+
+    if green_pixels < 80 and red_pixels < 80:
+        return None
+
+    if green_pixels > red_pixels:
+        mask = green_mask
+        color_name = "GREEN"
+    else:
+        mask = red_mask
+        color_name = "RED"
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+
+    if area > 60:
+        x, y, w, h = cv2.boundingRect(c)
+        return (color_name, c, x + w//2, y + h//2, area, w)
+    return None
+
+def find_best_object_with_scaling(frame_big):
+    # PRIMJENI ROI NA ORIGINALNI FREJM
+    frame_roi = apply_roi(frame_big)
+
+    if frame_roi is None or frame_roi.shape[0] == 0:
+        return None
+
+    frame_small = cv2.resize(frame_roi, (160, 120), interpolation=cv2.INTER_NEAREST)
+    result = find_best_object_fast(frame_small)
+
+    if result:
+        color_name, contour, cx_small, cy_small, area, w = result
+        cx_big = cx_small * 2
+        cy_big = cy_small * 2
+        if contour is not None and len(contour) > 0:
+            contour_scaled = contour * 2
+        else:
+            contour_scaled = None
+        return (color_name, contour_scaled, cx_big, cy_big, area * 4, w * 2)
+    return None
+
+# ======================
+# GLAVNA LOGIKA
+# ======================
+def generate_frames():
+    global running, mode, action_start_time, current_turn_direction
+    global initial_turn_direction, detected_color, pid_integral, last_error
+    global frame_counter, last_detection_result, last_detection_frame_time
+    global obstacle_counter, parking_active, parking_step
+    global search_after_parking, search_direction, last_obstacle_color
+    global wait_start_time
+
+    last_time = time.time()
+    fps_counter = 0
+    fps_timer = time.time()
+    search_rotate_start = 0
+
+    while True:
+        try:
+            current_time = time.time()
+            dt = current_time - last_time
+            last_time = current_time
+
+            if parking_active:
+                parking_loop()
+
+            fps_counter += 1
+            if current_time - fps_timer >= 1.0:
+                fps_counter = 0
+                fps_timer = current_time
+
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+
+            # Napravi kopiju za prikaz sa ROI linijom
+            display_frame = frame.copy()
+            h, w = display_frame.shape[:2]
+            cut_from_bottom = params["ROI_BOTTOM_CUT"]
+
+            # Nacrtaj liniju gdje je ROI odsječen
+            if cut_from_bottom > 0 and cut_from_bottom < h:
+                cv2.line(display_frame, (0, h - cut_from_bottom), (w, h - cut_from_bottom), (0, 255, 255), 2)
+                cv2.putText(display_frame, f"ROI CUT: {cut_from_bottom}px", (10, h - cut_from_bottom - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+            frame_counter += 1
+
+            if frame_counter % DETECTION_EVERY_N_FRAMES == 0:
+                obj = find_best_object_with_scaling(frame)
+                last_detection_result = obj
+                last_detection_frame_time = current_time
+            else:
+                obj = last_detection_result
+
+            dist = get_distance()
+            gyro_change = get_gyro_change()
+            gyro_raw = gyro_raw_angle
+            gyro_parking_change = get_gyro_change_from_parking_zero()
+
+            h_disp, w_disp, _ = display_frame.shape
+            cx, cy = w_disp // 2, h_disp // 2
+
+            cv2.circle(display_frame, (cx, cy), 5, (255, 255, 255), -1)
+
+            # ===== SEARCH MODE - traženje prepreke nakon parkinga =====
+            if search_after_parking and not parking_active:
+                if mode != "SEARCHING":
+                    mode = "SEARCHING"
+                    # Ako imamo zadnju boju, postavi smjer traženja
+                    if last_obstacle_color:
+                        if last_obstacle_color == "GREEN":
+                            search_direction = "RIGHT"
+                            print(f"🔍 SEARCH MODE: Nakon ZELENE, tražim DESNO")
+                        elif last_obstacle_color == "RED":
+                            search_direction = "LEFT"
+                            print(f"🔍 SEARCH MODE: Nakon CRVENE, tražim LIJEVO")
+
+                    # Skreni u smjeru traženja
+                    if search_direction == "LEFT":
+                        set_servo_turn("LEFT")
+                    else:
+                        set_servo_turn("RIGHT")
+                    time.sleep(0.2)
+                    motor_forward(params["SEARCH_SPEED"])
+                    reset_gyro_zero()
+                    search_rotate_start = time.time()
+                    print(f"🔍 SEARCH MODE: Rotiram {'LIJEVO' if search_direction == 'LEFT' else 'DESNO'} i tražim prepreku...")
+
+                # Ako je detektovan objekat, prekini search mode
+                if obj:
+                    motor_stop()
+                    set_servo(params["CENTER"])
+                    detected_color = obj[0]
+                    last_obstacle_color = detected_color  # ZAPAMTI BOJU ZA SLJEDECI PUT
+                    search_after_parking = False
+                    running = True
+                    mode = "APPROACH"
+                    pid_integral = 0
+                    last_error = 0
+                    obstacle_counter = 0
+                    print(f"\n✅ SEARCH MODE: Pronađena prepreka {detected_color}! Nastavljam sa zaobilaženjem...")
+
+                # Ako se okrenuo previše a nema prepreke, stani (sigurnosno)
+                elif abs(gyro_change) > 180:
+                    motor_stop()
+                    search_after_parking = False
+                    running = False
+                    mode = "WAIT_FOR_OBJECT"
+                    print("⚠️ SEARCH MODE: Nema prepreke u krugu od 180°")
+
+            # ===== GLAVNI PROGRAM ZA ZAOBILAŽENJE =====
+            elif running and not parking_active and not search_after_parking:
+                if mode == "WAIT_FOR_OBJECT":
+                    motor_stop()
+                    set_servo(params["CENTER"])
+
+                    # Ako je prvi put u WAIT_FOR_OBJECT, zabilježi vrijeme
+                    if wait_start_time == 0:
+                        wait_start_time = current_time
+
+                    # Provjeri da li je proslo 3 sekunde bez detekcije
+                    if current_time - wait_start_time >= params["OBSTACLE_AVOID_TIMEOUT"]:
+                        print(f"\n⚠️ Nema prepreke {params['OBSTACLE_AVOID_TIMEOUT']} sekundi! Mjerim udaljenosti...")
+
+                        # Izmjeri udaljenosti lijevo i desno
+                        dist_left = get_distance_left()
+                        dist_right = get_distance_right()
+
+                        print(f"   📏 Lijeva udaljenost: {dist_left:.1f} cm")
+                        print(f"   📏 Desna udaljenost: {dist_right:.1f} cm")
+
+                        # Ako je lijeva udaljenost MANJA od desne, idi DESNO (tamo gdje je veća udaljenost)
+                        if dist_left < dist_right:
+                            print(f"   🔄 Lijeva je manja ({dist_left:.1f} < {dist_right:.1f}) -> skrećem DESNO")
+                            current_turn_direction = "RIGHT"
+                            set_servo_turn("RIGHT")
+                        else:
+                            print(f"   🔄 Desna je manja ({dist_right:.1f} < {dist_left:.1f}) -> skrećem LIJEVO")
+                            current_turn_direction = "LEFT"
+                            set_servo_turn("LEFT")
+
+                        time.sleep(0.1)
+                        motor_forward(params["TURN_SPEED"])
+                        mode = "AVOID_OBSTACLE"
+                        action_start_time = current_time
+                        wait_start_time = 0  # Resetuj timer
+
+                    if obj:
+                        detected_color = obj[0]
+                        print(f"\n✅ DETEKTOVANO: {detected_color}")
+                        mode = "APPROACH"
+                        pid_integral = 0
+                        last_error = 0
+                        wait_start_time = 0  # Resetuj timer
+                    time.sleep(0.05)
+
+                elif mode == "APPROACH":
+                    if obj and obj[0] == detected_color:
+                        target_x = obj[2]
+                        error = target_x - cx
+
+                        if abs(error) < params["DEAD_ZONE"]:
+                            error = 0
+                            pid_integral = 0
+
+                        error = max(-50, min(50, error))
+
+                        if dt > 0 and dt < 0.1:
+                            pid_integral += error * dt
+                            pid_integral = max(-50, min(50, pid_integral))
+                            derivative = (error - last_error) / dt
+                        else:
+                            derivative = 0
+
+                        servo_correction = (params["PID_KP"] * error) + (params["PID_KI"] * pid_integral) + (params["PID_KD"] * derivative)
+                        servo_correction = max(-15, min(15, servo_correction))
+
+                        set_servo(params["CENTER"] + servo_correction)
+                        last_error = error
+
+                        if obj[1] is not None:
+                            cv2.drawContours(display_frame, [obj[1]], -1, (0, 255, 0) if detected_color == "GREEN" else (0, 0, 255), 2)
+                        cv2.line(display_frame, (cx, cy-10), (cx, cy+10), (255, 255, 255), 2)
+                        cv2.line(display_frame, (cx-10, cy), (cx+10, cy), (255, 255, 255), 2)
+                        cv2.putText(display_frame, f"Err:{error}", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+
+                        motor_forward()
+
+                        if dist <= params["DIST_THRESHOLD"]:
+                            motor_stop()
+                            print(f"\n🎯 STIGAO NA {dist:.1f}cm")
+                            obstacle_counter += 1
+                            print(f"📊 Zaobiđeno prepreka: {obstacle_counter}")
+
+                            if detected_color == "GREEN":
+                                initial_turn_direction = "LEFT"
+                            else:
+                                initial_turn_direction = "RIGHT"
+
+                            current_turn_direction = initial_turn_direction
+                            mode = "STOP_AND_RESET"
+                            action_start_time = time.time()
+                    else:
+                        set_servo(params["CENTER"])
+                        mode = "WAIT_FOR_OBJECT"
+                        wait_start_time = time.time()
+
+                elif mode == "AVOID_OBSTACLE":
+                    # Rotiraj u odabranom smjeru
+                    if current_time - action_start_time >= params["AVOID_TURN_TIME"]:
+                        motor_stop()
+                        set_servo(params["CENTER"])
+                        mode = "WAIT_FOR_OBJECT"
+                        wait_start_time = time.time()
+                        print(f"✅ Izbjegavanje završeno, nastavljam traženje...")
+
+                    cv2.putText(display_frame, f"AVOIDING: {current_turn_direction}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+                elif mode == "STOP_AND_RESET":
+                    if time.time() - action_start_time > params["STOP_TIME"]:
+                        reset_gyro_zero()
+                        mode = "TURN_FIRST"
+                        action_start_time = time.time()
+                        print(f"🔄 Prvo skretanje: {current_turn_direction}")
+                        set_servo_turn(current_turn_direction)
+                        time.sleep(0.1)
+
+                elif mode == "TURN_FIRST":
+                    motor_forward(params["TURN_SPEED"])
+                    current_change = get_gyro_change()
+
+                    if current_turn_direction == "LEFT":
+                        if current_change <= -params["TURN_ANGLE"]:
+                            motor_stop()
+                            mode = "TURN_FIRST_DONE"
+                            action_start_time = time.time()
+                            print(f"✅ Skrenuo LIJEVO za {abs(current_change):.1f}°")
+                    else:
+                        if current_change >= params["TURN_ANGLE"]:
+                            motor_stop()
+                            mode = "TURN_FIRST_DONE"
+                            action_start_time = time.time()
+                            print(f"✅ Skrenuo DESNO za {current_change:.1f}°")
+
+                    cv2.putText(display_frame, f"Change: {current_change:.1f}°", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+                elif mode == "TURN_FIRST_DONE":
+                    if time.time() - action_start_time > params["STOP_TIME"]:
+                        set_servo(params["CENTER"])
+                        time.sleep(0.1)
+                        mode = "STRAIGHT_FIRST"
+                        action_start_time = time.time()
+                        print(f"🚗 Vožnja pravo {params['STRAIGHT_TIME']}s")
+
+                elif mode == "STRAIGHT_FIRST":
+                    motor_forward()
+                    if time.time() - action_start_time > params["STRAIGHT_TIME"]:
+                        motor_stop()
+                        mode = "STRAIGHT_FIRST_DONE"
+                        action_start_time = time.time()
+                        print("⏸️ Vožnja završena")
+
+                elif mode == "STRAIGHT_FIRST_DONE":
+                    if time.time() - action_start_time > params["STOP_TIME"]:
+                        opposite_dir = "RIGHT" if current_turn_direction == "LEFT" else "LEFT"
+                        set_servo_turn(opposite_dir)
+                        time.sleep(0.1)
+                        mode = "RETURN_TO_ZERO"
+                        action_start_time = time.time()
+                        print(f"🔄 Vraćam se na 0° (skrećem {opposite_dir})")
+
+                elif mode == "RETURN_TO_ZERO":
+                    motor_forward(params["TURN_SPEED"])
+                    current_change = get_gyro_change()
+
+                    if abs(current_change) < 3:
+                        motor_stop()
+                        mode = "RETURN_TO_ZERO_DONE"
+                        action_start_time = time.time()
+                        print(f"✅ Vratio se na {current_change:.1f}°")
+
+                elif mode == "RETURN_TO_ZERO_DONE":
+                    if time.time() - action_start_time > params["STOP_TIME"]:
+                        set_servo(params["CENTER"])
+                        time.sleep(0.1)
+
+                        if obstacle_counter >= 2:
+                            print(f"🎯 DOSTIGNUTO 2 PREPREKE! Krećem u FINALNO SKRETANJE od 75°")
+                            mode = "FINAL_TURN"
+                            reset_gyro_zero()
+                            action_start_time = time.time()
+                        else:
+                            mode = "CHECK_OBJECT"
+                            action_start_time = time.time()
+                            print("🔍 Provjeravam ima li prepreke...")
+
+                elif mode == "CHECK_OBJECT":
+                    if time.time() - action_start_time > 0.5:
+                        if obj:
+                            print(f"✅ Ima prepreka! Nastavljam")
+                            detected_color = obj[0]
+                            mode = "APPROACH"
+                        else:
+                            # NOVA LOGIKA ZA PRVU PREPREKU (count = 1)
+                            if obstacle_counter == 1:
+                                front_dist = get_distance()
+                                print(f"📏 Prednji senzor: {front_dist:.1f} cm")
+
+                                if front_dist < params["FRONT_DIST_THRESHOLD"]:
+                                    # Ako je ispred nas zid ili prepreka, idi LIJEVO polako
+                                    print(f"🚨 Prednji senzor je {front_dist:.1f}cm (< {params['FRONT_DIST_THRESHOLD']}cm) - skrećem LIJEVO i tražim prepreku...")
+                                    current_turn_direction = "LEFT"
+                                    set_servo_turn("LEFT")
+                                    time.sleep(0.1)
+                                    reset_gyro_zero()
+                                    mode = "LEFT_TURN_AFTER_FIRST"
+                                    action_start_time = time.time()
+                                    motor_forward(params["LEFT_TURN_SPEED"])
+                                else:
+                                    # Ako je ispred prazno, radi staru logiku (skretanje desno 20°)
+                                    print(f"✅ Prednji senzor je {front_dist:.1f}cm (>= {params['FRONT_DIST_THRESHOLD']}cm) - radim staru logiku (skrećem desno 20°)")
+                                    current_turn_direction = "RIGHT"
+                                    set_servo_turn("RIGHT")
+                                    time.sleep(0.1)
+                                    reset_gyro_zero()
+                                    mode = "SIMPLE_TURN"
+                                    action_start_time = time.time()
+                            else:
+                                # Za count = 0 ili count > 1, radi staru logiku
+                                print("❌ Nema prepreke! Rotiram se 20° desno...")
+                                current_turn_direction = "RIGHT"
+                                set_servo_turn("RIGHT")
+                                time.sleep(0.1)
+                                reset_gyro_zero()
+                                mode = "SIMPLE_TURN"
+                                action_start_time = time.time()
+
+                elif mode == "LEFT_TURN_AFTER_FIRST":
+                    # Kreće se lijevo i traži prepreku
+                    motor_forward(params["LEFT_TURN_SPEED"])
+
+                    # Ako je detektovana prepreka, idi ka njoj
+                    if obj:
+                        motor_stop()
+                        set_servo(params["CENTER"])
+                        detected_color = obj[0]
+                        last_obstacle_color = detected_color
+                        mode = "APPROACH"
+                        pid_integral = 0
+                        last_error = 0
+                        print(f"\n✅ LEFT_TURN: Pronađena prepreka {detected_color}! Nastavljam sa zaobilaženjem...")
+
+                    cv2.putText(display_frame, f"LEFT TURN - trazim prepreku...", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
+
+                elif mode == "SIMPLE_TURN":
+                    motor_forward(params["TURN_SPEED"])
+                    current_change = get_gyro_change()
+
+                    if current_change >= params["TURN_ANGLE"]:
+                        motor_stop()
+                        mode = "SIMPLE_TURN_DONE"
+                        action_start_time = time.time()
+                        print(f"✅ Rotirao za {current_change:.1f}° desno")
+
+                elif mode == "SIMPLE_TURN_DONE":
+                    if time.time() - action_start_time > params["STOP_TIME"]:
+                        set_servo(params["CENTER"])
+                        time.sleep(0.1)
+                        mode = "WAIT_FOR_OBJECT"
+                        print("🔍 Nastavljam pretragu...\n")
+
+                elif mode == "FINAL_TURN":
+                    # PROVJERI DA LI JE DETEKTOVANA PREPREKA TOKOM FINAL_TURN
+                    if obj:
+                        print(f"\n🎯 DETEKTOVANA PREPREKA TOKOM FINALNOG SKRETANJA! Prekidam final turn i idem ka {obj[0]}")
+                        motor_stop()
+                        set_servo(params["CENTER"])
+                        detected_color = obj[0]
+                        mode = "APPROACH"
+                        pid_integral = 0
+                        last_error = 0
+                        obstacle_counter = 0
+                        continue  # Preskoči ostatak FINAL_TURN logike
+
+                    motor_forward(params["FINAL_TURN_SPEED"])
+
+                    if params["FINAL_TURN_DIRECTION"] == "LEFT":
+                        set_servo(params["FINAL_TURN_SERVO_LEFT"])
+                        current_change = get_gyro_change()
+                        cv2.putText(display_frame, f"FINAL LEFT: {current_change:.1f}/{-params['FINAL_TURN_ANGLE']}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
+
+                        if current_change <= -params["FINAL_TURN_ANGLE"]:
+                            motor_stop()
+                            mode = "FINAL_TURN_DONE"
+                            action_start_time = time.time()
+                            print(f"✅ Finalno skretanje LIJEVO za {abs(current_change):.1f}°")
+                    else:
+                        set_servo(params["FINAL_TURN_SERVO_RIGHT"])
+                        current_change = get_gyro_change()
+                        cv2.putText(display_frame, f"FINAL RIGHT: {current_change:.1f}/{params['FINAL_TURN_ANGLE']}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
+
+                        if current_change >= params["FINAL_TURN_ANGLE"]:
+                            motor_stop()
+                            mode = "FINAL_TURN_DONE"
+                            action_start_time = time.time()
+                            print(f"✅ Finalno skretanje DESNO za {current_change:.1f}°")
+
+                elif mode == "FINAL_TURN_DONE":
+                    if time.time() - action_start_time > 0.5:
+                        set_servo(params["CENTER"])
+                        time.sleep(0.2)
+                        obstacle_counter = 0
+                        print("🔄 Brojač resetovan na 0. Tražim novu prepreku...")
+                        mode = "WAIT_FOR_OBJECT"
+
+                elif mode == "SEARCHING":
+                    # Ovdje je search mode - rotira i traži
+                    if obj:
+                        motor_stop()
+                        set_servo(params["CENTER"])
+                        detected_color = obj[0]
+                        last_obstacle_color = detected_color  # ZAPAMTI BOJU
+                        search_after_parking = False
+                        mode = "APPROACH"
+                        pid_integral = 0
+                        last_error = 0
+                        obstacle_counter = 0
+                        print(f"\n✅ Pronađena prepreka {detected_color}! Nastavljam...")
+
+            # Prikaz info na ekranu
+            cv2.putText(display_frame, f"Dist:{dist:.0f}cm", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.putText(display_frame, f"ROI Cut: {params['ROI_BOTTOM_CUT']}px", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+
+            if parking_active:
+                cv2.putText(display_frame, f"MODE:PARK-{parking_step}", (5, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+            elif search_after_parking:
+                cv2.putText(display_frame, f"MODE:SEARCHING", (5, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+            else:
+                cv2.putText(display_frame, f"Mode:{mode}", (5, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+            cv2.putText(display_frame, f"Gyro:{gyro_change:.1f}", (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+            cv2.putText(display_frame, f"Count:{obstacle_counter}", (5, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            cv2.putText(display_frame, f"ParkGyro:{gyro_parking_change:.1f}", (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+
+            _, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 20])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+        except Exception as e:
+            print(f"Frame error: {e}")
+            time.sleep(0.01)
+            continue
+
+# ======================
+# WEB RUTE
+# ======================
+@app.route('/')
+def index():
+    return """
+    <html>
+    <head>
+        <style>
+            body { font-family: Arial; text-align: center; background: #1a1a1a; color: white; }
+            button { margin: 10px; padding: 15px 30px; font-size: 18px; cursor: pointer; }
+            .park-btn { background: #ff6600; }
+            .info { font-size: 20px; margin: 10px; }
+            img { width: 100%; max-width: 640px; border: 3px solid #00ff00; border-radius: 5px; }
+            .roi-control { margin: 20px; padding: 15px; background: #333; border-radius: 10px; }
+            .roi-control input { width: 300px; margin: 10px; }
+        </style>
+    </head>
+    <body>
+        <h2>🤖 Robot - Zaobilaženje prepreka + ISPARKIRAVANJE + ROI</h2>
+
+        <button onclick="fetch('/start')" style="background:#00ff00;">🚀 START ZAOBILAZENJE</button>
+        <button onclick="fetch('/stop')" style="background:#ff0000;">🛑 STOP</button>
+        <button onclick="fetch('/park')" class="park-btn" style="background:#ff6600;">🅿️ ISPARKIRAJ SE</button>
+        <button onclick="fetch('/gyro_reset')" style="background:#ffff00; color:black;">🎯 RESET GYRO</button>
+
+        <div class="roi-control">
+            <h3>🎯 ROI (Region of Interest) - Odsijecanje donjeg dijela</h3>
+            <p>Odsijeci donjih: <span id="roi_value">80</span> piksela</p>
+            <input type="range" id="roi_slider" min="0" max="180" value="80" step="5">
+            <button onclick="setROI()">PRIMJENI ROI</button>
+            <p style="font-size: 12px; color: #ffaa00;">⚠️ Veći broj = više odsječeno odozdo (samo gornji dio se detektuje)</p>
+        </div>
+
+        <br>
+        <div class="info">
+            <p id="dist">📏 Distance: -- cm</p>
+            <p id="gyro">📍 Gyro: --°</p>
+            <p id="mode">🔄 Mode: --</p>
+            <p id="count">🔢 Prepreke: 0</p>
+            <p id="roi_status">✂️ ROI cut: 80px</p>
+        </div>
+        <img src="/video" width="640">
+        <script>
+            function setROI() {
+                let value = document.getElementById("roi_slider").value;
+                fetch('/set_roi?cut=' + value).then(r=>r.json()).then(data => {
+                    document.getElementById("roi_value").innerText = value;
+                    document.getElementById("roi_status").innerText = "✂️ ROI cut: " + value + "px";
+                });
+            }
+
+            document.getElementById("roi_slider").addEventListener("input", function() {
+                document.getElementById("roi_value").innerText = this.value;
+            });
+
+            setInterval(() => {
+                fetch('/distance').then(r=>r.json()).then(d =>
+                    document.getElementById("dist").innerText = "📏 Distance: " + d.distance.toFixed(1) + " cm"
+                );
+                fetch('/gyro_status').then(r=>r.json()).then(g =>
+                    document.getElementById("gyro").innerText = "📍 Gyro: " + g.change.toFixed(1) + "°"
+                );
+                fetch('/mode_status').then(r=>r.json()).then(m =>
+                    document.getElementById("mode").innerText = "🔄 Mode: " + m.mode
+                );
+                fetch('/count_status').then(r=>r.json()).then(c =>
+                    document.getElementById("count").innerText = "🔢 Prepreke: " + c.count
+                );
+                fetch('/get_roi').then(r=>r.json()).then(r =>
+                    document.getElementById("roi_status").innerText = "✂️ ROI cut: " + r.cut + "px"
+                );
+            }, 200);
+        </script>
+    </body>
+    </html>
+    """
+
+@app.route('/start')
+def start():
+    global running, mode, detected_color, pid_integral, last_error, obstacle_counter, parking_active, search_after_parking, wait_start_time
+    if parking_active:
+        return "Parking je aktivan, sačekaj da završi"
+    running = True
+    mode = "WAIT_FOR_OBJECT"
+    detected_color = None
+    pid_integral = 0
+    last_error = 0
+    obstacle_counter = 0
+    search_after_parking = False
+    wait_start_time = 0
+    reset_gyro_zero()
+    set_servo(params["CENTER"])
+    print("\n=== 🤖 ROBOT START ===")
+    return "START"
+
+@app.route('/stop')
+def stop():
+    global running, search_after_parking
+    running = False
+    search_after_parking = False
+    motor_stop()
+    print("\n=== 🛑 ROBOT STOP ===")
+    return "STOP"
+
+@app.route('/park')
+def park():
+    global running, parking_active, search_after_parking
+    if parking_active:
+        return "Parking je već aktivan"
+    running = False
+    search_after_parking = False
+    start_parking()
+    return "ISPARKIRAVANJE ZAPOČETO"
+
+@app.route('/gyro_reset')
+def gyro_reset():
+    reset_gyro_zero()
+    return jsonify({"status": "ok", "change": get_gyro_change()})
+
+@app.route('/gyro_status')
+def gyro_status():
+    return jsonify({
+        "raw": gyro_raw_angle,
+        "start": gyro_start_angle,
+        "change": get_gyro_change(),
+        "parking_zero": gyro_parking_zero,
+        "parking_change": get_gyro_change_from_parking_zero(),
+        "velocity": gyro_velocity,
+        "direction": gyro_direction,
+        "connected": gyro_connected
+    })
+
+@app.route('/mode_status')
+def mode_status():
+    if parking_active:
+        return jsonify({"mode": f"PARKING-{parking_step}"})
+    elif search_after_parking:
+        return jsonify({"mode": "SEARCHING"})
+    return jsonify({"mode": mode})
+
+@app.route('/count_status')
+def count_status():
+    return jsonify({"count": obstacle_counter})
+
+@app.route('/distance')
+def distance_api():
+    return jsonify({"distance": last_distance})
+
+@app.route('/set_roi')
+def set_roi():
+    cut = request.args.get('cut', default=80, type=int)
+    cut = max(0, min(180, cut))  # Ograniči između 0 i 180
+    params["ROI_BOTTOM_CUT"] = cut
+    print(f"✂️ ROI postavljen: odsiječeno {cut} piksela odozdo")
+    return jsonify({"status": "ok", "cut": cut})
+
+@app.route('/get_roi')
+def get_roi():
+    return jsonify({"cut": params["ROI_BOTTOM_CUT"]})
+
+@app.route('/video')
+def video():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ======================
+# MAIN
+# ======================
+if __name__ == '__main__':
+    try:
+        print("\n=== 🤖 ROBOT - ZAOBILAZENJE PREPREKA + ISPARKIRAVANJE + ROI ===")
+        print("Pokretanje...")
+
+        print("\n📋 PARAMETRI ISPARKIRAVANJA (možeš ih promijeniti u kodu):")
+        print(f"   - Parking smjer: {PARKING_PARAMS['PARKING_DIRECTION']}")
+        print(f"   - Prvo kretanje nazad: {PARKING_PARAMS['INITIAL_BACKWARD_TIME']}s")
+        print(f"   - Kretanje naprijed: {PARKING_PARAMS['FORWARD_TIME']}s")
+        print(f"   - Kretanje nazad: {PARKING_PARAMS['BACKWARD_TIME']}s")
+        print(f"   - Zadnje kretanje naprijed: {PARKING_PARAMS['FINAL_FORWARD_TIME']}s")
+        print(f"   - Brzina: {PARKING_PARAMS['SPEED']}")
+        print(f"   - Servo lijevo: {PARKING_PARAMS['SERVO_LEFT']}°")
+        print(f"   - Servo desno: {PARKING_PARAMS['SERVO_RIGHT']}°")
+
+        print("\n📋 ROI PARAMETRI:")
+        print(f"   - ROI_BOTTOM_CUT: {params['ROI_BOTTOM_CUT']} piksela odozdo")
+        print(f"   - Veći broj = detektuje se samo gornji dio slike")
+
+        print("\n📋 SENZORI ZA IZBJEGAVANJE:")
+        print(f"   - Lijevi senzor: TRIG=GPIO16, ECHO=GPIO26")
+        print(f"   - Desni senzor: TRIG=GPIO6, ECHO=GPIO19")
+        print(f"   - Timeout: {params['OBSTACLE_AVOID_TIMEOUT']}s bez detekcije -> aktivira izbjegavanje")
+        print(f"   - Vrijeme skretanja: {params['AVOID_TURN_TIME']}s")
+
+        print("\n📋 NOVA LOGIKA ZA PRVU PREPREKU (count=1):")
+        print(f"   - Ako je prednji senzor < {params['FRONT_DIST_THRESHOLD']}cm -> skreće LIJEVO polako (brzina {params['LEFT_TURN_SPEED']})")
+        print(f"   - Ako je prednji senzor >= {params['FRONT_DIST_THRESHOLD']}cm -> radi staru logiku (skreće desno 20°)")
+        print(f"   - Kreće se lijevo sve dok ne vidi novu prepreku")
+
+        set_servo(params["CENTER"])
+        print("\n✅ Robot spreman!")
+        print(f"✅ Žiroskop povezan: {gyro_connected}")
+        print("\n🌐 Dostupno na: http://raspberrypi.local:5000")
+        print("\n🅿️ Za isparkiravanje klikni dugme ili idi na /park")
+        print("\n📌 NAKON ISPARKIRAVANJA:")
+        print(f"   - Robot će skrenuti {PARKING_PARAMS['PARKING_DIRECTION']} i tražiti prepreku")
+        print("   - Kada pronađe prepreku, kreće u zaobilaženje")
+        print("\n📌 DETEKCIJA TOKOM FINAL TURN:")
+        print("   - Ako se pojavi prepreka, prekida final turn i ide ka njoj")
+        print("\n📌 DINAMIČKI SEARCH MODE:")
+        print("   - Nakon zaobilaženja ZELENE → traži DESNO")
+        print("   - Nakon zaobilaženja CRVENE → traži LIJEVO")
+        print("\n📌 ROI (REGION OF INTEREST):")
+        print("   - Možeš podešavati koliko piksela odozdo će se odsjeći")
+        print("   - Detekcija se vrši samo na gornjem dijelu slike")
+        print("\n📌 IZBJEGAVANJE ĆORSOKAKA:")
+        print("   - Ako robot ne vidi prepreku 3 sekunde, mjeri udaljenosti lijevo/desno")
+        print("   - Skreće u smjeru gdje je VEĆA udaljenost")
+        print("\n📌 NOVO - LOGIKA NAKON PRVE PREPREKE:")
+        print("   - Ako je ispred zid (<70cm) → skreće LIJEVO i traži prepreku")
+        print("   - Ako je ispred prazno → skreće desno 20° (stara logika)")
+
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    finally:
+        motor_stop()
+        pi.set_servo_pulsewidth(params["SERVO_PIN"], 0)
+        pi.stop()
