@@ -92,11 +92,11 @@ SLIKE ROBOTA
 
 
 <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/0d39d4a0-6914-4eec-80b1-7aa16f751630" />
- <img width="305" height="421" alt="image" src="https://github.com/user-attachments/assets/c7a6d514-61ee-4673-8103-7c185b2e584e" />
- <img width="322" height="447" alt="image" src="https://github.com/user-attachments/assets/4d25177e-2429-49dd-8410-08f1026698c4" />
-   <img width="305" height="445" alt="image" src="https://github.com/user-attachments/assets/fa1e6108-ba65-4c0f-ab29-5afb58f4ad6e" />
-<img width="320" height="461" alt="image" src="https://github.com/user-attachments/assets/a8022ac7-1826-46d2-a533-787b9ecaca67" />
-<img width="345" height="460" alt="image" src="https://github.com/user-attachments/assets/5433b0c5-a41e-4c14-82bb-154791f1f0ac" />
+ <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/c7a6d514-61ee-4673-8103-7c185b2e584e" />
+ <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/4d25177e-2429-49dd-8410-08f1026698c4" />
+   <img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/fa1e6108-ba65-4c0f-ab29-5afb58f4ad6e" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/a8022ac7-1826-46d2-a533-787b9ecaca67" />
+<img width="322" height="429" alt="image" src="https://github.com/user-attachments/assets/5433b0c5-a41e-4c14-82bb-154791f1f0ac" />
                
                                               
 
