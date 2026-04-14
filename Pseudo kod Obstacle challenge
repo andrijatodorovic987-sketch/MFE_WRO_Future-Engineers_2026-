@@ -1,0 +1,207 @@
+# =============================================
+# PSEUDOKOD - ROBOT ZA ZAOBILAŽENJE PREPREKA
+# =============================================
+
+# 1. INICIJALIZACIJA
+# --------------------
+# Učitaj konfiguracijske parametre:
+#   - Pinovi za motore, servo, senzore (ultrasonic, gyro, kamera)
+#   - PID parametri za praćenje objekta
+#   - Vremena i brzine za parking
+#   - ROI (odsijecanje donjeg dijela slike)
+
+# Pokreni pigpio (GPIO kontroler)
+# Poveži se na žiroskop preko serijskog porta (thread za čitanje)
+# Inicijaliziraj kameru (320x240, MJPG, smanjen buffer)
+
+# Postavi servo u centar, zaustavi motore
+
+
+# 2. GLAVNA PETLJA (generate_frames)
+# --------------------------------------
+# Petlja traje dok god aplikacija radi:
+#   A. Pročitaj frejm s kamere
+#   B. Primijeni ROI (odsijeci donjih N piksela)
+#   C. Detektiraj objekte (crveni/zeleni) svakih N frejmova
+#   D. Očitaj udaljenosti (prednji, lijevi, desni senzor)
+#   E. Očitaj promjenu kuta iz žiroskopa
+#   F. Ako je PARKING AKTIVAN -> izvršavaj parking rutinu
+#   G. Ako je SEARCH_AFTER_PARKING -> traži prepreku rotacijom
+#   H. Ako je RUNNING -> izvršavaj glavni FSM (zaobilaženje)
+#   I. Prikazi informacije na frejmu (distanca, mod, gyro, itd.)
+#   J. Pošalji frejm kao MJPEG stream
+
+
+# 3. PARKING RUTINA (isparkiravanje)
+# ------------------------------------
+# Kada se pozove /park:
+#   1. Zaustavi sve, aktiviraj parking flag
+#   2. Zabilježi početni kut žiroskopa (gyro_parking_zero)
+#   3. Izvršaj 12 koraka:
+#      Korak 1:  Vožnja nazad (0.4s)
+#      Korak 2:  Pauza (0.2s)
+#      Korak 3:  Skreni točkove u smjeru parkinga (lijevo ili desno)
+#      Korak 4:  Vožnja naprijed (0.7s)
+#      Korak 5:  Pauza (0.2s)
+#      Korak 6:  Ispravi točkove (centar)
+#      Korak 7:  Vožnja nazad (0.6s)
+#      Korak 8:  Pauza (0.2s)
+#      Korak 9:  Skreni točkove u smjeru parkinga
+#      Korak 10: Vožnja naprijed (1.5s)
+#      Korak 11: Pauza (0.2s)
+#      Korak 12: Skreni u suprotnom smjeru i vraćaj se na 0° (gyro)
+#   4. Završi parking, aktiviraj SEARCH_MODE za traženje prepreke
+
+
+# 4. SEARCH MODE (traženje prepreke nakon parkinga)
+# --------------------------------------------------
+# Nakon isparkiravanja:
+#   - Odredi smjer traženja prema zadnjoj boji (zelena -> desno, crvena -> lijevo)
+#   - Skreni točkove u taj smjer
+#   - Kreći se naprijed lagano
+#   - Rotiraj dok ne detektuješ objekt
+#   - Kada se objekt pojavi, prekini search i započni zaobilaženje
+
+
+# 5. GLAVNI FSM ZA ZAOBILAŽENJE PREPREKA
+# ----------------------------------------
+# Stanja i prijelazi:
+
+# WAIT_FOR_OBJECT:
+#   - Čekaj detekciju objekta (crveni/zeleni)
+#   - Ako nema objekta 3 sekunde:
+#       * Izmjeri udaljenosti lijevo i desno
+#       * Skreni u smjeru gdje je VEĆA udaljenost (izbjegavanje ćorsokaka)
+#       * Prijeđi u AVOID_OBSTACLE
+#   - Ako se objekt pojavi:
+#       * Zapamti boju, prijeđi u APPROACH
+
+# APPROACH:
+#   - Prati objekt PID regulatorom (centriranje)
+#   - Kreći se naprijed
+#   - Kada si na udaljenosti <= 30cm:
+#       * Zaustavi se, povećaj brojač prepreka
+#       * Odredi smjer skretanja (zelena -> lijevo, crvena -> desno)
+#       * Prijeđi u STOP_AND_RESET
+
+# STOP_AND_RESET:
+#   - Pauza (STOP_TIME)
+#   - Resetiraj gyro na 0°
+#   - Prijeđi u TURN_FIRST
+
+# TURN_FIRST:
+#   - Skreni u odabranom smjeru (lijevo ili desno za 20°)
+#   - Prati promjenu kuta preko gyro-a
+#   - Kada postigneš kut -> zaustavi se, prijeđi u TURN_FIRST_DONE
+
+# TURN_FIRST_DONE:
+#   - Kratka pauza
+#   - Ispravi točkove u centar
+#   - Prijeđi u STRAIGHT_FIRST
+
+# STRAIGHT_FIRST:
+#   - Vožnja pravo (STRAIGHT_TIME sekundi)
+#   - Prijeđi u STRAIGHT_FIRST_DONE
+
+# STRAIGHT_FIRST_DONE:
+#   - Kratka pauza
+#   - Skreni u suprotnom smjeru (da se vratiš na originalnu putanju)
+#   - Prijeđi u RETURN_TO_ZERO
+
+# RETURN_TO_ZERO:
+#   - Kreći se naprijed, prati gyro
+#   - Vraćaj se prema 0° (gyro promjena -> 0)
+#   - Kada si unutar 3° -> zaustavi se, prijeđi u RETURN_TO_ZERO_DONE
+
+# RETURN_TO_ZERO_DONE:
+#   - Kratka pauza
+#   - Ispravi točkove u centar
+#   - Ako je brojač prepreka >= 2:
+#       * Prijeđi u FINAL_TURN (krajnje skretanje od 75°)
+#   - Inače:
+#       * Prijeđi u CHECK_OBJECT
+
+# CHECK_OBJECT:
+#   - Provjeri ima li objekta nakon 0.5s
+#   - Ako ima -> prijeđi u APPROACH (nastavi zaobilaženje)
+#   - Ako nema:
+#       * Ako je brojač prepreka == 1 (prva prepreka):
+#           - Izmjeri prednju udaljenost
+#           - Ako je prednji senzor < 70cm (zid ispred):
+#               * Skreni LIJEVO, kreći se lagano (LEFT_TURN_SPEED)
+#               * Prijeđi u LEFT_TURN_AFTER_FIRST (traži prepreku)
+#           - Ako je prednji senzor >= 70cm (prazno):
+#               * Skreni desno 20°, prijeđi u SIMPLE_TURN
+#       * Inače (brojač == 0 ili > 1):
+#           * Skreni desno 20°, prijeđi u SIMPLE_TURN
+
+# LEFT_TURN_AFTER_FIRST:
+#   - Kreći se lijevo i traži prepreku
+#   - Ako se objekt pojavi -> prijeđi u APPROACH
+#   - Inače nastavi kretanje
+
+# SIMPLE_TURN:
+#   - Rotiraj desno za 20° prateći gyro
+#   - Prijeđi u SIMPLE_TURN_DONE
+
+# SIMPLE_TURN_DONE:
+#   - Kratka pauza, ispravi točkove
+#   - Prijeđi u WAIT_FOR_OBJECT (traži novu prepreku)
+
+# FINAL_TURN:
+#   - Skreni u FINAL_TURN_DIRECTION za FINAL_TURN_ANGLE (75°)
+#   - Prati gyro promjenu
+#   - Ako se pojavi objekt tokom skretanja -> prekini i prijeđi u APPROACH
+#   - Kada postigneš kut -> prijeđi u FINAL_TURN_DONE
+
+# FINAL_TURN_DONE:
+#   - Kratka pauza, ispravi točkove
+#   - Resetiraj brojač prepreka na 0
+#   - Prijeđi u WAIT_FOR_OBJECT (traži novu prepreku)
+
+# AVOID_OBSTACLE (izbjegavanje ćorsokaka):
+#   - Rotiraj u odabranom smjeru (AVOID_TURN_TIME sekundi)
+#   - Zaustavi se, ispravi točkove
+#   - Prijeđi u WAIT_FOR_OBJECT
+
+
+# 6. POMOĆNE FUNKCIJE
+# --------------------
+# - motor_forward(speed)      : vožnja naprijed
+# - motor_backward(speed)     : vožnja nazad
+# - motor_stop()              : zaustavljanje
+# - set_servo(angle)          : postavi servo kut
+# - get_distance()            : očitaj prednji ultrazvučni senzor
+# - get_distance_left()       : očitaj lijevi senzor
+# - get_distance_right()      : očitaj desni senzor
+# - gyro_reader_thread()      : čita žiroskop u pozadini
+# - get_gyro_change()         : promjena kuta od zadnjeg resetiranja
+# - get_gyro_change_from_parking_zero() : promjena od početka parkinga
+# - reset_gyro_zero()         : resetiraj referentni kut
+# - find_best_object_with_scaling(frame) : detekcija crvene/zelene boje
+# - apply_roi(frame)          : odsijeci donji dio slike
+
+
+# 7. WEB RUTE (Flask)
+# --------------------
+# /              : HTML interfejs sa slajderom za ROI
+# /start         : pokreni zaobilaženje prepreka
+# /stop          : zaustavi robota
+# /park          : pokreni isparkiravanje
+# /gyro_reset    : resetiraj žiroskop
+# /gyro_status   : vrati trenutno stanje žiroskopa
+# /mode_status   : vrati trenutni mod rada
+# /count_status  : vrati broj zaobiđenih prepreka
+# /distance      : vrati zadnju izmjerenu udaljenost
+# /set_roi       : postavi ROI (odsijecanje donjeg dijela)
+# /get_roi       : vrati trenutnu ROI vrijednost
+# /video         : MJPEG stream s kamerom i grafikom
+
+
+# 8. GLAVNI TOK IZVRŠAVANJA
+# ---------------------------
+# if __name__ == '__main__':
+#     Ispiši sve parametre i upute
+#     Inicijaliziraj servo u centar
+#     Pokreni Flask server na portu 5000
+#     U slučaju prekida -> zaustavi motore, isključi servo, ugasi pigpio
